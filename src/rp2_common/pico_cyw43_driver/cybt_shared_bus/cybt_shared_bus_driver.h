@@ -61,6 +61,9 @@ void cybt_sharedbus_driver_init(struct _cyw43_ll_t *driver);
 
 cybt_result_t cybt_init_buffer(void);
 
+// Supply the BT shared-memory base from the host (0 = fall back to the register).
+void cybt_set_wlan_ram_base(uint32_t base);
+
 cybt_result_t cybt_reg_write_idx(cybt_addr_idx_t reg_idx, uint32_t value);
 cybt_result_t cybt_mem_write_idx(cybt_addr_idx_t mem_idx, uint32_t offset, const uint8_t *p_data, uint32_t data_len);
 cybt_result_t cybt_mem_read_idx(cybt_addr_idx_t mem_idx, uint32_t offset, uint8_t *p_data, uint32_t data_len);

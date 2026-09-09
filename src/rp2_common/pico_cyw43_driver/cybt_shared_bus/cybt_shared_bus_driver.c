@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <assert.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "cyw43_ll.h"
 #include "cybt_shared_bus_driver.h"
@@ -47,6 +48,22 @@ static uint32_t last_bt_ctrl_reg;
 #define B2H_BUF_OUT_ADDR            (buf_info.bt2host_out_addr)
 
 static uint32_t wlan_ram_base_addr;
+
+/*
+ * BT shared-memory base supplied by the host transport (0 = none). On the
+ * Pico W / Pico 2 W the WLAN firmware publishes this address in
+ * WLAN_RAM_BASE_REG_ADDR, but after the chip has been allowed to sleep once
+ * (any BT bring-up that is not the very first thing after WiFi init) that
+ * register has been seen to read back 0. The WHD host driver can still fetch
+ * the address over the WLAN command path (the bus:btsdiobufaddr iovar), so the
+ * transport passes it in here and cybt_init_buffer prefers it over the
+ * register. See cyw43_bt_whd_glue.c.
+ */
+static uint32_t supplied_wlan_ram_base;
+
+void cybt_set_wlan_ram_base(uint32_t base) {
+    supplied_wlan_ram_base = base;
+}
 volatile uint32_t host_ctrl_cache_reg = 0;
 #define WLAN_RAM_BASE_ADDR            (wlan_ram_base_addr)
 
@@ -588,7 +605,10 @@ static cybt_result_t cybt_mem_write(uint32_t mem_addr, const uint8_t *p_data, ui
         if ((mem_addr & 0xFFF) + transfer_size > 0x1000) {
             transfer_size = 0x1000 - (mem_addr & 0xFFF);
         }
-        cyw43_ll_write_backplane_mem(cyw43_ll, mem_addr, transfer_size, p_data);
+        if (cyw43_ll_write_backplane_mem(cyw43_ll, mem_addr, transfer_size, p_data) != 0) {
+            cybt_error("cybt_mem_write: backplane write at 0x%08lx failed\n", mem_addr);
+            return CYBT_ERR_HCI_WRITE_FAILED;
+        }
         cybt_debug("  write_mem addr 0x%08lx len %ld\n", mem_addr, transfer_size);
         DUMP_BYTES(p_data, transfer_size);
         data_len -= transfer_size;
@@ -606,7 +626,10 @@ static cybt_result_t cybt_mem_read(uint32_t mem_addr, uint8_t *p_data, uint32_t 
         if ((mem_addr & 0xFFF) + transfer_size > 0x1000) {
             transfer_size = 0x1000 - (mem_addr & 0xFFF);
         }
-        cyw43_ll_read_backplane_mem(cyw43_ll, mem_addr, transfer_size, p_data);
+        if (cyw43_ll_read_backplane_mem(cyw43_ll, mem_addr, transfer_size, p_data) != 0) {
+            cybt_error("cybt_mem_read: backplane read at 0x%08lx failed\n", mem_addr);
+            return CYBT_ERR_HCI_READ_FAILED;
+        }
         cybt_debug("  read_mem addr 0x%08lx len %ld\n", mem_addr, transfer_size);
         DUMP_BYTES(p_data, transfer_size);
         data_len -= transfer_size;
@@ -681,13 +704,57 @@ cybt_result_t cybt_mem_read_idx(cybt_addr_idx_t mem_idx, uint32_t offset, uint8_
     return cybt_mem_read(mem_addr, p_data, data_len);
 }
 
+/*
+ * The BTSDIO ring buffers live in WLAN RAM at a base the firmware publishes.
+ * A value of 0 (seen on a Pico 2 W when BT is brought up after the chip has
+ * slept) is not a usable base: every ring address becomes 0 + offset, the
+ * first HCI command is written to backplane address 0, and the host then sits
+ * in a 10 s command timeout and (with CONFIG_BT_ASSERT=y) halts the kernel,
+ * taking USB down with it. Reject an implausible base so bring-up fails
+ * cleanly and the caller can retry or raise, instead of proceeding blind.
+ */
+#define CYBT_RAM_BASE_READ_MAX      (50)
+#define CYBT_RAM_BASE_READ_DELAY_MS (1)
+#define CYBT_WLAN_RAM_LIMIT         (0x00200000)
+
+static bool cybt_ram_base_plausible(uint32_t base) {
+    return base != 0 && base != 0xffffffff && (base & 3) == 0 &&
+           base < (CYBT_WLAN_RAM_LIMIT - (BTSDIO_OFFSET_BT2HOST_OUT + 4));
+}
+
 cybt_result_t cybt_init_buffer(void) {
     int result;
-    result = cybt_reg_read(WLAN_RAM_BASE_REG_ADDR, &WLAN_RAM_BASE_ADDR);
-    if (CYBT_SUCCESS != result) {
-        return result;
+    uint32_t base = 0;
+
+    /*
+     * Prefer the base the transport fetched over the WLAN command path; it is
+     * reliable across a chip sleep, whereas the register read below is not.
+     */
+    if (cybt_ram_base_plausible(supplied_wlan_ram_base)) {
+        base = supplied_wlan_ram_base;
+        cybt_info("cybt_init_buffer: using host-supplied btfw ram base 0x%08lx\n",
+                  (unsigned long) base);
+    } else {
+        int attempt;
+
+        for (attempt = 0; attempt < CYBT_RAM_BASE_READ_MAX; attempt++) {
+            result = cybt_reg_read(WLAN_RAM_BASE_REG_ADDR, &base);
+            if (CYBT_SUCCESS != result) {
+                return result;
+            }
+            if (cybt_ram_base_plausible(base)) {
+                break;
+            }
+            cyw43_delay_ms(CYBT_RAM_BASE_READ_DELAY_MS);
+        }
+        if (!cybt_ram_base_plausible(base)) {
+            cybt_error("cybt_init_buffer: WLAN_RAM_BASE unusable (0x%08lx) after %d reads\n",
+                       (unsigned long) base, CYBT_RAM_BASE_READ_MAX);
+            return CYBT_ERR_HCI_INIT_FAILED;
+        }
     }
 
+    WLAN_RAM_BASE_ADDR = base;
     cybt_debug("hci_open(): btfw ram base = 0x%" PRIx32 "\n", WLAN_RAM_BASE_ADDR);
 
     // Fill in reg info
